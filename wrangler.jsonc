@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-otel-sample",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-19",
+  // Required by @microlabs/otel-cf-workers: the OTel context manager needs
+  // AsyncLocalStorage to keep spans parented across await boundaries.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    "APP_OTLP_ENDPOINT": "http://localhost:4318/app/v1/traces",
+    "TRAJECTORY_OTLP_ENDPOINT": "http://localhost:4318/trajectory/v1/traces"
+  }
+}

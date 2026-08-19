@@ -1,0 +1,11 @@
+# Required: the sample calls a real model.
+OPENAI_API_KEY=sk-...
+
+# Where each span stream is sent. Defaults below point at `pnpm sink`,
+# the local OTLP receiver in scripts/sink.mjs.
+APP_OTLP_ENDPOINT=http://localhost:4318/app/v1/traces
+TRAJECTORY_OTLP_ENDPOINT=http://localhost:4318/trajectory/v1/traces
+
+# Optional per-stream auth, sent as an Authorization header.
+# APP_OTLP_TOKEN=
+# TRAJECTORY_OTLP_TOKEN=
