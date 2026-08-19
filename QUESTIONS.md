@@ -8,23 +8,42 @@ how much they would change the design.
 
 ### 1. Span export when the response streams
 
-`POST /chat` returns at the first token. The agent keeps running afterwards —
-opening and closing spans — so the request root span ends and flushes while its
-children are still in flight. In a local run the trace arrives in two batches:
-one span, then three.
+We hit this for real, so this is less "how does it work" and more "is our
+workaround the one you would recommend".
 
-`@microlabs/otel-cf-workers` handles this with `ctx.waitUntil`, and it appears
-to work. What we cannot see from outside:
+`POST /chat` returns at the first token. `otel-cf-workers` flushes a trace when
+its root span ends — and the root span ends when the handler returns the
+`Response`, not when the body finishes streaming. With the library's own
+`BatchTraceSpanProcessor`, one request produced:
 
-- Is `waitUntil` the right primitive for this, or is there a lifecycle hook
-  intended for "the response body has finished streaming"?
-- How long will `waitUntil` actually keep the isolate alive under load, and
-  what happens to spans still open when that budget runs out — dropped
-  silently, or is there a signal?
-- Does an aborted client connection cut the export short?
+```
+batch 1 [app] fetchHandler POST      start=+0ms    end=+2ms
+batch 2 [app] invoke_agent           start=+2ms    end=+7ms     ← still running
+              chat gpt-5             start=+3ms    end=+7ms     ← really ended +3988ms
+...
+batch 8 [app] execute_tool calculator
+              (step 3's chat span and the final invoke_agent span never arrived)
+```
 
-The failure mode we care about is a trajectory that exports partially, since a
-truncated trajectory is worse than none for evaluation.
+Two failures. Spans still open at flush time were exported with a forced end
+time and without the attributes written later, and spans that finished after
+the last flush were dropped entirely. For an evaluation store a truncated
+trajectory is worse than no trajectory.
+
+Our fix is `src/telemetry/processor.ts`: ignore the library's flush, buffer
+ended spans, and flush explicitly from the handler under `ctx.waitUntil`, keyed
+on the promise that settles when the last step completes. That produces one
+correct batch per stream.
+
+- Is `waitUntil` the right primitive, or is there a hook for "the response body
+  has finished streaming" that we should be using instead?
+- How long will `waitUntil` really keep the isolate alive under load, and what
+  happens to buffered spans when that budget runs out — dropped silently, or is
+  there a signal we can catch and act on?
+- Does an aborted client connection cut the flush short? A user closing the tab
+  mid-answer is common, and we would still want the partial trajectory.
+- Is flush-on-root-span-end simply the wrong default for streaming responses on
+  Workers, and if so is that worth fixing upstream rather than in every app?
 
 ### 2. `recordInputs` / `recordOutputs` are not a per-integration filter
 
@@ -86,10 +105,11 @@ for the whole trace, not per stream.
 
 ### 6. Proving the application stream is clean
 
-Right now the guarantee is an allowlist plus a code review. We would like it to
-be a test that fails CI, and beyond that, something enforced outside our code —
-so that a mistake in this repo cannot put customer content in an operational
-backend.
+Right now the guarantee is an allowlist plus a code review. A verified run
+gives 0 content attributes on the application stream and 16 on the trajectory
+stream, which is the number we would assert in CI. Beyond that we want
+something enforced outside our code, so that a mistake in this repo cannot put
+customer content in an operational backend.
 
 Is there a Workers-side enforcement point for that — an egress policy, a
 binding that can only reach one endpoint, anything that makes the boundary

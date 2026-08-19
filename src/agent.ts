@@ -19,7 +19,11 @@ export function runAgent(options: {
   const { integrations } = createAgentTelemetry(options.conversationId)
 
   return streamText({
-    model: openai('gpt-5'),
+    // Chat Completions rather than the Responses API. Responses references
+    // prior reasoning items by id across steps, which a Zero Data Retention
+    // org cannot resolve — the second step fails with "Items are not
+    // persisted". Chat Completions sends each step self-contained.
+    model: openai.chat('gpt-5'),
     system: SYSTEM_PROMPT,
     messages: options.messages,
     tools: { calculator },

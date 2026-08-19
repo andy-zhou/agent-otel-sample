@@ -2,7 +2,7 @@ import { instrument } from '@microlabs/otel-cf-workers'
 import { Hono } from 'hono'
 import type { ModelMessage } from 'ai'
 import { runAgent } from './agent'
-import { traceConfig } from './telemetry/config'
+import { spanProcessor, traceConfig } from './telemetry/config'
 import type { Env } from './env'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -33,7 +33,16 @@ app.post('/chat', async (c) => {
   })
 
   // Returns as soon as the first token is ready. The agent keeps running —
-  // and keeps opening and closing spans — after this Response is handed back.
+  // and keeps opening and closing spans — after this Response is handed back,
+  // so the flush has to wait for generation rather than for the handler.
+  // `result.steps` settles when the last step is done.
+  // `result.steps` is a PromiseLike, so it is wrapped rather than chained.
+  c.executionCtx.waitUntil(
+    Promise.resolve(result.steps)
+      .catch(() => undefined)
+      .then(() => spanProcessor(c.env).flush()),
+  )
+
   return result.toTextStreamResponse()
 })
 

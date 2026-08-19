@@ -8,6 +8,7 @@
  */
 
 import { createServer } from 'node:http'
+import { appendFileSync } from 'node:fs'
 
 const PORT = Number(process.env.PORT ?? 4318)
 const CONTENT_ATTRS = new Set([
@@ -108,6 +109,9 @@ createServer((req, res) => {
   req.on('data', (chunk) => chunks.push(chunk))
   req.on('end', () => {
     const stream = req.url?.startsWith('/trajectory') ? 'trajectory' : 'app'
+    if (process.env.OTLP_RAW) {
+      appendFileSync(process.env.OTLP_RAW, JSON.stringify({ stream, body: Buffer.concat(chunks).toString('utf8') }) + '\n')
+    }
     try {
       const spans = flatten(JSON.parse(Buffer.concat(chunks).toString('utf8')))
       if (spans.length > 0) printTree(stream, spans)
