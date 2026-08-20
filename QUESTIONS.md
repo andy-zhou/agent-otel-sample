@@ -125,6 +125,11 @@ current 0.221.x.
   should take instead?
 - If we used upstream `@opentelemetry/sdk-trace-base` directly, what breaks on
   Workers? Bundle size and the context manager are our two worries.
+- Its auto-instrumented `fetch` span appears to end when the response begins,
+  not when a streamed body has been consumed: for step 1 the `fetch` span
+  reads 1144ms inside a `chat` span of 5091ms. Is that intended? For an
+  SSE-heavy workload it makes the outbound span close to meaningless as a
+  latency measure.
 - Where does Workers Observability fit? Could it be the destination for the
   application stream, and if so does it accept OTLP directly?
 

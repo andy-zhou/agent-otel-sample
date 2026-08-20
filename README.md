@@ -42,51 +42,51 @@ matching `*_OTLP_TOKEN`.
 
 ## What it emits
 
-One request produces one trace. Abridged, from an actual run of
-`pnpm demo` against `gpt-5`:
+One request produces one trace. Abridged, from an actual run of `pnpm demo`
+against `gpt-5`:
 
 ```
-── app stream          trace c9ed…0d09   10 spans, 0 content attributes
-  fetchHandler POST 8ms
+── app stream          trace e217e5e4…   10 spans, 0 content attributes
+  fetchHandler POST 7ms
     · http.request.method = POST
     · url.path = /chat
     · http.response.status_code = 200
-    invoke_agent math-assistant 4534ms
+    invoke_agent math-assistant 7202ms
       · gen_ai.request.model = gpt-5
-      · gen_ai.conversation.id = fixed-1
-      · gen_ai.usage.input_tokens = 753
-      · gen_ai.usage.output_tokens = 204
+      · gen_ai.conversation.id = resp-1
+      · gen_ai.usage.input_tokens = 971
+      · gen_ai.usage.output_tokens = 300
       · agent.step.count = 3
       · gen_ai.response.finish_reasons = [stop]
-      chat gpt-5 2923ms
+      chat gpt-5 5091ms
         · agent.step.number = 1
         · gen_ai.response.finish_reasons = [tool-calls]
-        · gen_ai.usage.input_tokens = 201
-        · gen_ai.usage.output_tokens = 162
-        · gen_ai.usage.reasoning.output_tokens = 128
-        · gen_ai.response.time_to_first_chunk = 2765
-        · agent.lm.response_ms = 2923
-        fetch POST api.openai.com 2758ms
-          · url.full = https://api.openai.com/v1/chat/completions
+        · gen_ai.usage.input_tokens = 120
+        · gen_ai.usage.output_tokens = 261
+        · gen_ai.usage.reasoning.output_tokens = 192
+        · gen_ai.response.time_to_first_chunk = 4874
+        · agent.lm.response_ms = 5090
+        fetch POST api.openai.com 1144ms
+          · url.full = https://api.openai.com/v1/responses
           · http.response.status_code = 200
-      execute_tool calculator 0ms
+      execute_tool calculator 1ms
         · gen_ai.tool.name = calculator
         · agent.tool.execution_ms = 0
-      chat gpt-5 905ms          …step 2
+      chat gpt-5 1285ms      …step 2, input_tokens = 400, finish = [tool-calls]
       execute_tool calculator 0ms
-      chat gpt-5 696ms          …step 3, finish_reasons = [stop]
+      chat gpt-5 818ms       …step 3, input_tokens = 451, finish = [stop]
 
-── trajectory stream   trace c9ed…0d09   6 spans, 16 content attributes
-  invoke_agent math-assistant 4534ms
-    · gen_ai.usage.input_tokens = 753
+── trajectory stream   trace e217e5e4…   6 spans, 16 content attributes
+  invoke_agent math-assistant 7202ms
+    · gen_ai.usage.input_tokens = 971
     ◆ gen_ai.input.messages = [{"role":"user","content":"What is 17% of 4320, then divide that by 3?"}]
     ◆ gen_ai.system_instructions = "You are a careful arithmetic assistant…"
     ◆ gen_ai.output.messages = [{"role":"assistant","content":[{"type":"tool-call",…
-    chat gpt-5 2923ms
+    chat gpt-5 5091ms
       ◆ gen_ai.input.messages = […]
       ◆ gen_ai.tool.definitions = [{"type":"function","name":"calculator",…}]
       ◆ gen_ai.output.messages = [{"type":"tool-call","toolName":"calculator","input":{"operation":"multiply"…
-    execute_tool calculator 0ms
+    execute_tool calculator 1ms
       ◆ gen_ai.tool.call.arguments = {"operation":"multiply","a":4320,"b":0.17}
       ◆ gen_ai.tool.call.result = {"result":734.4000000000001}
     …
@@ -99,6 +99,10 @@ part of a trajectory, so shipping it to an evaluation store would be noise.
 
 Both streams carry the operational attributes. The difference is one-way: the
 trajectory stream is the application stream plus content, minus infrastructure.
+
+The per-step `gen_ai.usage.input_tokens` climb — 120, 400, 451 — is the agent
+resending the conversation each step, which is worth being able to see: it is
+where cost growth in a long trajectory comes from.
 
 ## How the split works
 
@@ -212,10 +216,18 @@ scripts/sink.mjs                 local OTLP receiver
   check; asserting them in CI is the obvious next step (QUESTIONS.md #6).
 - **Streaming only.** `POST /chat` streams; there is no synchronous endpoint to
   compare against, so the trickiest lifecycle is the only one exercised.
-- **Chat Completions, not the Responses API.** Responses refers to prior
-  reasoning items by id across steps, which a Zero Data Retention org cannot
-  resolve — step 2 fails with "Items are not persisted". `openai.chat()` sends
-  each step self-contained.
+- **No sampling.** Everything is exported (QUESTIONS.md #5).
+
+## Provider configuration worth noting
+
+The agent sets `providerOptions.openai.store = false`. Without it, the
+Responses API refers to prior reasoning items by id, and a Zero Data Retention
+organisation cannot resolve them — step 2 fails with *"Items are not persisted
+for Zero Data Retention organizations"*. With `store: false` on a reasoning
+model the provider automatically adds `include: ['reasoning.encrypted_content']`
+and carries reasoning inline in the history instead.
+
+Any multi-step agent on the Responses API under ZDR needs this.
 
 ## Versions
 

@@ -19,17 +19,23 @@ export function runAgent(options: {
   const { integrations } = createAgentTelemetry(options.conversationId)
 
   return streamText({
-    // Chat Completions rather than the Responses API. Responses references
-    // prior reasoning items by id across steps, which a Zero Data Retention
-    // org cannot resolve — the second step fails with "Items are not
-    // persisted". Chat Completions sends each step self-contained.
-    model: openai.chat('gpt-5'),
+    model: openai('gpt-5'),
     system: SYSTEM_PROMPT,
     messages: options.messages,
     tools: { calculator },
     // Multi-step is the point: a single-step trace has no trajectory to
     // evaluate. Each step is one model call plus any tool calls it triggers.
     stopWhen: stepCountIs(6),
+    providerOptions: {
+      openai: {
+        // Zero Data Retention orgs cannot use the Responses API's default
+        // server-side item store: step 2 fails with "Items are not persisted"
+        // when prior reasoning is referenced by id. `store: false` makes the
+        // provider request `reasoning.encrypted_content` and send the whole
+        // history back inline instead.
+        store: false,
+      },
+    },
     telemetry: {
       // Content is recorded because the trajectory stream needs it. Keeping
       // it out of the app stream is our job, not this flag's.
