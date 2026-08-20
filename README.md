@@ -57,6 +57,8 @@ Abridged, from an actual run of `pnpm demo` against `gpt-5`:
         · gen_ai.usage.reasoning.output_tokens = 192
         · gen_ai.response.time_to_first_chunk = 4874
         · gen_ai.outcome = success
+        · gen_ai.openai.ratelimit.remaining_tokens = 39999384
+        · gen_ai.openai.ratelimit.reset_tokens = 0s
         fetch POST api.openai.com 345ms
       execute_tool calculator 1ms
         · gen_ai.tool.name = calculator
@@ -187,6 +189,30 @@ the creator must run before the writers and the closer after them. Collapsing
 those roles silently drops every attribute the other integration meant to add —
 the spans still appear, correctly shaped, just empty. Separate tracers make
 that problem not exist rather than solving it.
+
+### One thing needs model middleware
+
+Rate-limit headroom arrives as response headers, and the telemetry lifecycle
+events carry no headers. So `src/telemetry/rate-limits.ts` is a
+`wrapLanguageModel` middleware — a second instrumentation path, for data that
+arrives on the same HTTP response as the usage the hooks already give us.
+
+It is worth the detour because it is the only forward-looking capacity number
+a provider offers. Token counts say what a request cost; `remaining_tokens`
+says how many more like it get served before throttling starts. On a 429 the
+same middleware records `retry_after` off the error's response headers.
+
+Rather than emit a span of its own, it stamps onto whichever span is active —
+which during the provider call is the application stream's `chat` span, because
+`app-telemetry.ts` puts it there via `executeLanguageModelCall`. A separate span
+per model call to carry four numbers is a poor trade when the usage it would sit
+next to is already on `chat`.
+
+That the stamp lands on the *application* span rather than a trajectory one is
+a consequence of which integration's `executeLanguageModelCall` wraps
+innermost. Both ours and `@ai-sdk/otel`'s implement it. It resolves in our
+favour, and it is verified rather than assumed — but it is not something we
+control, which is QUESTIONS.md #13.
 
 ### We flush, not the library
 

@@ -1,7 +1,8 @@
 import { createOpenAI } from '@ai-sdk/openai'
-import { stepCountIs, streamText, type ModelMessage } from 'ai'
+import { stepCountIs, streamText, wrapLanguageModel, type ModelMessage } from 'ai'
 import { appTelemetry } from './telemetry/app-telemetry'
 import { facetAttributes } from './telemetry/facets'
+import { rateLimitMiddleware } from './telemetry/rate-limits'
 import { trajectory } from './telemetry/trajectory'
 import { calculator } from './tools'
 import type { Env } from './env'
@@ -23,7 +24,12 @@ export function runAgent(options: {
   const facets = facetAttributes(options.facets)
 
   return streamText({
-    model: openai('gpt-5'),
+    // The middleware exists only to reach the provider's rate-limit response
+    // headers, which the telemetry lifecycle events do not expose.
+    model: wrapLanguageModel({
+      model: openai('gpt-5'),
+      middleware: [rateLimitMiddleware()],
+    }),
     system: SYSTEM_PROMPT,
     messages: options.messages,
     tools: { calculator },

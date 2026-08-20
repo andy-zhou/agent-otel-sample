@@ -202,19 +202,30 @@ semconv 1.43 has no equivalent. Two questions:
   silently splits a cost dashboard in half. Does your tooling key on the
   semconv name?
 
-### 13. Provider rate-limit headers are not reachable from telemetry events
+### 13. Rate-limit headers need a second instrumentation path
 
 The most useful capacity signal a provider gives us is its rate-limit response
 headers — `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-requests`,
-`retry-after` on a 429. Those are exactly what the application stream should
-carry, and they are per-model-call.
+`retry-after` on a 429. The AI SDK's telemetry events carry no headers, so
+`src/telemetry/rate-limits.ts` reaches them with `wrapLanguageModel` middleware
+and stamps them onto the active span, which during the provider call is the
+application stream's `chat` span.
 
-The AI SDK's telemetry events do not expose response headers, so the only way
-to capture them is to wrap the model with `wrapLanguageModel` middleware and
-emit a span from there — a second, parallel instrumentation path alongside the
-telemetry integrations, for data that arrives on the same HTTP response.
+It works — verified, real numbers on the right spans. Two things about it we
+are not comfortable with:
 
-- Is there a Workers-side way to observe outbound response headers that we
-  should prefer over model middleware?
-- More generally: should provider throttling be a platform-level signal rather
-  than something every application re-derives from headers?
+- Which span the stamp lands on depends on whose
+  `executeLanguageModelCall` wraps innermost, since both our integration and
+  `@ai-sdk/otel` implement that hook. It currently resolves our way. Nothing in
+  the contract says it must, and if it flipped, capacity data would silently
+  move to the evaluation backend and vanish from the operational one. Is there
+  a defined composition order, or should we not be relying on the active span
+  at all?
+- More broadly: every application on your platform calling a model provider
+  needs these same six numbers, and each one is re-deriving them from headers
+  with its own middleware. Is provider throttling something the platform could
+  surface — on the outbound fetch span, say — rather than something each
+  application reimplements?
+
+And a Workers-specific one: is there any way to observe outbound *response*
+headers from the platform side that we should prefer over model middleware?
