@@ -1,59 +1,23 @@
 /**
- * The two span streams, and the rule that separates them.
+ * Attributes the application stream carries beyond OTel semantic conventions.
  *
- * There is one logical trace per request. Every span is tagged with an
- * audience, and the exporter projects the trace twice: once for the
- * application stream (operational, no user content) and once for the
- * trajectory stream (full fidelity, for evaluation).
+ * There is no allowlist here any more, and no per-span audience marker. The
+ * two streams are written by two different tracers into two different
+ * providers (see trajectory.ts), so the application stream contains exactly
+ * what `app-telemetry.ts` writes and nothing else. Keeping content out of it
+ * is a property of that one file rather than of a filter applied later.
+ *
+ * Semconv 1.43 covers almost everything. These four it does not:
+ *
+ * `gen_ai.outcome` separates provider throttling from a real failure — one
+ * means buy capacity, the other means fix something, and a status code alone
+ * does not tell them apart. `gen_ai.usage.total_tokens` saves every query
+ * summing two attributes. `error.kind` / `error.message` are span attributes
+ * because several APM backends read error information from attributes and
+ * ignore the OTel exception event, so a span that looks clean there is not
+ * evidence of a clean request.
  */
 
-import {
-  ATTR_GEN_AI_AGENT_NAME,
-  ATTR_GEN_AI_CONVERSATION_ID,
-  ATTR_GEN_AI_OPERATION_NAME,
-  ATTR_GEN_AI_OUTPUT_TYPE,
-  ATTR_GEN_AI_PROVIDER_NAME,
-  ATTR_GEN_AI_REQUEST_MAX_TOKENS,
-  ATTR_GEN_AI_REQUEST_MODEL,
-  ATTR_GEN_AI_REQUEST_STOP_SEQUENCES,
-  ATTR_GEN_AI_REQUEST_STREAM,
-  ATTR_GEN_AI_REQUEST_TEMPERATURE,
-  ATTR_GEN_AI_REQUEST_TOP_P,
-  ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
-  ATTR_GEN_AI_RESPONSE_ID,
-  ATTR_GEN_AI_RESPONSE_MODEL,
-  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
-  ATTR_GEN_AI_TOOL_CALL_ID,
-  ATTR_GEN_AI_TOOL_NAME,
-  ATTR_GEN_AI_TOOL_TYPE,
-  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS,
-  ATTR_GEN_AI_WORKFLOW_NAME,
-} from '@opentelemetry/semantic-conventions/incubating'
-
-/** Which stream(s) a span belongs in. Stripped before export. */
-export const ATTR_AUDIENCE = 'telemetry.audience'
-
-export type Audience = 'app' | 'trajectory' | 'both'
-
-/**
- * Non-semconv attributes we add ourselves. Prefixed so a reviewer can tell
- * at a glance what is standard and what we invented.
- */
-/**
- * Not in semconv 1.43, but wanted anyway.
- *
- * `gen_ai.outcome` makes throttling countable and distinct from generic
- * failure, which a status code alone does not give you. `gen_ai.usage.
- * total_tokens` saves every dashboard from summing two attributes.
- *
- * `error.kind` / `error.message` are span *attributes* because several APM
- * backends read those and ignore the OTel exception event — so a span that
- * looks error-free there is not evidence of an error-free request.
- */
 export const ATTR_OUTCOME = 'gen_ai.outcome'
 export const ATTR_USAGE_TOTAL_TOKENS = 'gen_ai.usage.total_tokens'
 export const ATTR_ERROR_KIND = 'error.kind'
@@ -65,74 +29,3 @@ export const ATTR_TOOL_EXECUTION_MS = 'agent.tool.execution_ms'
 export const ATTR_LM_RESPONSE_MS = 'agent.lm.response_ms'
 export const ATTR_LM_OUTPUT_TOKENS_PER_SECOND = 'agent.lm.output_tokens_per_second'
 export const ATTR_LM_TOTAL_TOKENS_PER_SECOND = 'agent.lm.total_tokens_per_second'
-
-/**
- * Attributes the application stream is allowed to carry.
- *
- * This is the PII boundary, and it is an allowlist on purpose: a new
- * content-bearing attribute added anywhere in this repo is dropped from the
- * application stream by default rather than leaked by default.
- */
-export const APP_ATTRIBUTE_ALLOWLIST: ReadonlySet<string> = new Set([
-  ATTR_GEN_AI_AGENT_NAME,
-  ATTR_GEN_AI_CONVERSATION_ID,
-  ATTR_GEN_AI_OPERATION_NAME,
-  ATTR_GEN_AI_OUTPUT_TYPE,
-  ATTR_GEN_AI_PROVIDER_NAME,
-  ATTR_GEN_AI_REQUEST_MAX_TOKENS,
-  ATTR_GEN_AI_REQUEST_MODEL,
-  ATTR_GEN_AI_REQUEST_STOP_SEQUENCES,
-  ATTR_GEN_AI_REQUEST_STREAM,
-  ATTR_GEN_AI_REQUEST_TEMPERATURE,
-  ATTR_GEN_AI_REQUEST_TOP_P,
-  ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
-  ATTR_GEN_AI_RESPONSE_ID,
-  ATTR_GEN_AI_RESPONSE_MODEL,
-  ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
-  ATTR_GEN_AI_TOOL_CALL_ID,
-  ATTR_GEN_AI_TOOL_NAME,
-  ATTR_GEN_AI_TOOL_TYPE,
-  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS,
-  ATTR_GEN_AI_WORKFLOW_NAME,
-  ATTR_OUTCOME,
-  ATTR_USAGE_TOTAL_TOKENS,
-  ATTR_ERROR_KIND,
-  ATTR_ERROR_MESSAGE,
-  ATTR_STEP_COUNT,
-  ATTR_STEP_NUMBER,
-  ATTR_TOOL_EXECUTION_MS,
-  ATTR_LM_RESPONSE_MS,
-  ATTR_LM_OUTPUT_TOKENS_PER_SECOND,
-  ATTR_LM_TOTAL_TOKENS_PER_SECOND,
-])
-
-/**
- * Infrastructure namespaces we did not author — the root fetch span and the
- * auto-instrumented outbound fetch to the model provider. Allowed wholesale
- * because they describe transport, not conversation.
- *
- * NB: `url.*` can carry PII in query strings for other applications. It is
- * safe here because the only outbound call is to the provider API.
- */
-const APP_ALLOWED_PREFIXES = [
-  'http.',
-  'url.',
-  'server.',
-  'network.',
-  'user_agent.',
-  'faas.',
-  'cloudflare.',
-  // Request-scoped dimensions the caller attaches to every span, so both
-  // streams can be sliced by session, task or agent loop. Identifiers only —
-  // never free text. See `facets` in integrations.ts.
-  'facet.',
-]
-
-export function isAppSafeAttribute(key: string): boolean {
-  if (APP_ATTRIBUTE_ALLOWLIST.has(key)) return true
-  return APP_ALLOWED_PREFIXES.some((prefix) => key.startsWith(prefix))
-}

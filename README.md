@@ -42,67 +42,49 @@ matching `*_OTLP_TOKEN`.
 
 ## What it emits
 
-One request produces one trace. Abridged, from an actual run of `pnpm demo`
-against `gpt-5`:
+One request produces one trace, and each stream gets its own tree within it.
+Abridged, from an actual run of `pnpm demo` against `gpt-5`:
 
 ```
-── app stream          trace e217e5e4…   10 spans, 0 content attributes
-  fetchHandler POST 7ms
-    · http.request.method = POST
-    · url.path = /chat
-    · http.response.status_code = 200
-    invoke_agent math-assistant 7202ms
-      · gen_ai.request.model = gpt-5
-      · gen_ai.conversation.id = resp-1
-      · gen_ai.usage.input_tokens = 971
-      · gen_ai.usage.output_tokens = 300
+── app stream          trace 93da21af…   10 spans, 0 content attributes
+  fetchHandler POST 20ms
+    invoke_agent math-assistant 7526ms
+      · gen_ai.usage.total_tokens = 1638
       · agent.step.count = 3
-      · gen_ai.response.finish_reasons = [stop]
-      chat gpt-5 5091ms
-        · agent.step.number = 1
-        · gen_ai.response.finish_reasons = [tool-calls]
-        · gen_ai.usage.input_tokens = 120
-        · gen_ai.usage.output_tokens = 261
+      · gen_ai.outcome = success
+      · facet.session_id = sess_42
+      chat gpt-5 4930ms
         · gen_ai.usage.reasoning.output_tokens = 192
         · gen_ai.response.time_to_first_chunk = 4874
-        · agent.lm.response_ms = 5090
-        fetch POST api.openai.com 1144ms
-          · url.full = https://api.openai.com/v1/responses
-          · http.response.status_code = 200
+        · gen_ai.outcome = success
+        fetch POST api.openai.com 345ms
       execute_tool calculator 1ms
         · gen_ai.tool.name = calculator
         · agent.tool.execution_ms = 0
-      chat gpt-5 1285ms      …step 2, input_tokens = 400, finish = [tool-calls]
+      chat gpt-5 1709ms
       execute_tool calculator 0ms
-      chat gpt-5 818ms       …step 3, input_tokens = 451, finish = [stop]
+      chat gpt-5 878ms
 
-── trajectory stream   trace e217e5e4…   6 spans, 16 content attributes
-  invoke_agent math-assistant 7202ms
-    · gen_ai.usage.input_tokens = 971
-    ◆ gen_ai.input.messages = [{"role":"user","content":"What is 17% of 4320, then divide that by 3?"}]
+── trajectory stream   trace 93da21af…    9 spans, 19 content attributes
+  invoke_agent gpt-5 7527ms
+    ◆ gen_ai.input.messages = [{"role":"user","content":"What is 17% of 4320…
     ◆ gen_ai.system_instructions = "You are a careful arithmetic assistant…"
-    ◆ gen_ai.output.messages = [{"role":"assistant","content":[{"type":"tool-call",…
-    chat gpt-5 5091ms
-      ◆ gen_ai.input.messages = […]
-      ◆ gen_ai.tool.definitions = [{"type":"function","name":"calculator",…}]
-      ◆ gen_ai.output.messages = [{"type":"tool-call","toolName":"calculator","input":{"operation":"multiply"…
-    execute_tool calculator 1ms
-      ◆ gen_ai.tool.call.arguments = {"operation":"multiply","a":4320,"b":0.17}
-      ◆ gen_ai.tool.call.result = {"result":734.4000000000001}
-    …
+    step 1 4932ms
+      chat gpt-5 4930ms
+        ◆ gen_ai.input.messages = […]
+        ◆ gen_ai.output.messages = [{"type":"tool-call","toolName":"calculator"…
+      execute_tool calculator 1ms
+        ◆ gen_ai.tool.call.arguments = {"operation":"multiply","a":4320,"b":0.17}
+        ◆ gen_ai.tool.call.result = {"result":734.4000000000001}
+    step 2 1710ms
+    step 3 879ms
 ```
 
-Note what each stream leaves out. The application stream has every token
-count, finish reason and timing, and no message text at all. The trajectory
-stream has no `fetchHandler` and no outbound `fetch` spans — transport is not
-part of a trajectory, so shipping it to an evaluation store would be noise.
-
-Both streams carry the operational attributes. The difference is one-way: the
-trajectory stream is the application stream plus content, minus infrastructure.
-
-The per-step `gen_ai.usage.input_tokens` climb — 120, 400, 451 — is the agent
-resending the conversation each step, which is worth being able to see: it is
-where cost growth in a long trajectory comes from.
+Same trace id, two trees. The application stream has every token count, finish
+reason and timing and no message text at all. The trajectory stream has the
+conversation, plus a `step` layer the application stream does not bother with,
+and none of the transport spans — `fetchHandler` and the outbound `fetch` are
+not part of a trajectory.
 
 ## How the split works
 
@@ -119,11 +101,6 @@ content-bearing ones, so the boundary is something we adopt rather than invent:
 - content — `gen_ai.input.messages`, `gen_ai.output.messages`,
   `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
   `gen_ai.tool.call.result`, `gen_ai.tool.definitions`
-
-`src/telemetry/streams.ts` holds the application stream's **allowlist**. It is
-an allowlist and not a denylist so that a new content attribute added anywhere
-in this repo is dropped from the application stream by default, rather than
-leaked by default.
 
 Four attributes are ours rather than semconv's, because semconv has no
 equivalent and dashboards need them:
@@ -152,59 +129,64 @@ stream that exists not to have any.
 
 ### Payload size is a first-class concern
 
-`gen_ai.tool.definitions` is compacted to tool *names*. The full JSON Schema is
-identical on every model call of every request, and it dwarfs the conversation
-it is attached to — for this sample, a one-tool agent, the uncompacted schema
-was larger than the entire chat history, repeated three times per request.
+`gen_ai.tool.definitions` now comes from `@ai-sdk/otel` and carries the full
+JSON Schema, identical on every model call of every request. For this sample —
+a one-tool agent — that schema is larger than the whole chat history, three
+times per request. A processor on the trajectory provider that rewrites the
+attribute to tool *names* is about ten lines and worth having before this runs
+at any volume.
 
-### Three integrations write the spans
+### Two tracers, not one trace filtered twice
 
-AI SDK v7 replaced v5's `experimental_telemetry` + ambient OTel tracer with a
-pluggable integration interface: lifecycle hooks (`onStart`,
-`onLanguageModelCallStart/End`, `onToolExecutionStart/End`, `onEnd`, `onError`)
-plus wrapper hooks (`executeLanguageModelCall`, `executeTool`) that let an
-integration run the underlying operation inside its own span context.
+This is the load-bearing decision, and it is the one thing to look at if you
+only read one file.
 
-There *is* an official bridge — `@ai-sdk/otel`, which exports an
-`OpenTelemetry` class implementing `Telemetry` and takes a `tracer`, an
-`enrichSpan` callback, and toggles for usage, provider metadata, headers, tool
-choice and schema. It also emits a `step` span between the operation and the
-model call, which this sample folds into an `agent.step.number` attribute
-instead.
+The two streams are written by **two different tracers backed by two different
+providers**:
 
-`src/telemetry/integrations.ts` is hand-written anyway, because the point of
-this repo is to make the routing seam visible: which attribute goes to which
-stream, and why. Whether a real deployment should hand-roll this or configure
-`@ai-sdk/otel` is QUESTIONS.md #11.
+- the ambient tracer that `otel-cf-workers` installs — the request span, the
+  outbound `fetch`, and everything `src/telemetry/app-telemetry.ts` writes
+- a standalone `BasicTracerProvider` in `src/telemetry/trajectory.ts`, whose
+  only processor ships to the evaluation backend
 
-The SDK fans every event out to each integration in registration order, and
-this sample uses three:
+Both are handed to the AI SDK together:
 
-1. **`app`** creates the spans and writes operational attributes
-2. **`trajectory`** writes user content onto those same spans
-3. **`closer`** ends them
+```ts
+telemetry: {
+  recordInputs: true,
+  recordOutputs: true,
+  integrations: [
+    appTelemetry(conversationId, facets),          // ours: no content, ever
+    trajectory(env).integration(facets),           // @ai-sdk/otel, all content
+  ],
+}
+```
 
-Lifecycle is separate because the first two constraints conflict: whoever
-creates a span must run before the writers, and whoever ends it must run after
-them. Folding `closer` back into `app` silently drops every trajectory
-attribute — `app.onStart` would then run *after* `trajectory.onStart` looked
-for a span that did not exist yet. That was a real bug during development, and
-it is invisible unless you count content attributes.
+`@ai-sdk/otel` is the AI SDK's official OpenTelemetry integration. Given a
+`tracer`, it writes the whole trajectory — prompts, completions, tool
+arguments, tool results, and a `step` span per model call — to spans that the
+application stream's provider never sees, **because it never created them**.
 
-`executeLanguageModelCall` is what puts the auto-instrumented outbound
-`fetch` to the provider underneath its `chat` span instead of beside the
-request root. It works.
+That is what makes the boundary structural. There is no allowlist to keep
+correct and no filter to misconfigure: the application stream contains exactly
+what one file writes, and that file never reads a content field off an event.
 
-### One exporter projects the trace twice
+Spans from both providers still parent off whatever is in the active context,
+so they share a trace id and you can pivot between backends by it. Parenting
+comes from context, not from the provider.
 
-`src/telemetry/exporter.ts` wraps two OTLP exporters. On export it partitions
-the batch by an audience marker and, for the application stream, rebuilds each
-span with only allowlisted attributes. The projection uses prototype
-delegation rather than a copy, because the OTLP transformer calls
-`spanContext()` and reads getters like `duration`.
+The cost, stated plainly: the agent portion of the trace exists **twice** — a
+`chat` span on each stream, not one span seen two ways. Roughly double the span
+volume for the agent, in exchange for a guarantee that does not depend on us.
 
-Every span carries an audience: infra spans we did not create default to
-`app`; spans we create are marked `both`.
+An earlier revision of this repo did the other thing: one span per operation,
+tagged with an audience, projected at the exporter. It worked, and it needed
+~380 more lines. It also had a failure mode worth recording, because it is
+invisible until you count attributes: when two integrations write to one span,
+the creator must run before the writers and the closer after them. Collapsing
+those roles silently drops every attribute the other integration meant to add —
+the spans still appear, correctly shaped, just empty. Separate tracers make
+that problem not exist rather than solving it.
 
 ### We flush, not the library
 
@@ -260,6 +242,12 @@ scripts/sink.mjs                 local OTLP receiver
 - **Streaming only.** `POST /chat` streams; there is no synchronous endpoint to
   compare against, so the trickiest lifecycle is the only one exercised.
 - **No sampling.** Everything is exported (QUESTIONS.md #5).
+- **The trajectory root has a dangling parent.** Its `invoke_agent` span is a
+  child of the request span, which only exists in the application stream, so an
+  evaluation backend sees a parent id it was never sent. The fix is a processor
+  on the trajectory provider that clears `parentSpanContext` on the elected
+  root; left out here to keep the moving parts countable.
+- **No tool-definition compaction** (see above).
 
 ## Provider configuration worth noting
 

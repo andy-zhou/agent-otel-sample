@@ -1,7 +1,10 @@
 import { createOpenAI } from '@ai-sdk/openai'
 import { stepCountIs, streamText, type ModelMessage } from 'ai'
-import { createAgentTelemetry, type Facets } from './telemetry/integrations'
+import { appTelemetry } from './telemetry/app-telemetry'
+import { facetAttributes } from './telemetry/facets'
+import { trajectory } from './telemetry/trajectory'
 import { calculator } from './tools'
+import type { Env } from './env'
 
 const SYSTEM_PROMPT = [
   'You are a careful arithmetic assistant.',
@@ -11,13 +14,13 @@ const SYSTEM_PROMPT = [
 ].join(' ')
 
 export function runAgent(options: {
-  apiKey: string
+  env: Env
   messages: ModelMessage[]
   conversationId?: string
-  facets?: Facets
+  facets?: Record<string, string | number | boolean>
 }) {
-  const openai = createOpenAI({ apiKey: options.apiKey })
-  const { integrations } = createAgentTelemetry(options.conversationId, options.facets)
+  const openai = createOpenAI({ apiKey: options.env.OPENAI_API_KEY })
+  const facets = facetAttributes(options.facets)
 
   return streamText({
     model: openai('gpt-5'),
@@ -30,20 +33,25 @@ export function runAgent(options: {
     providerOptions: {
       openai: {
         // Zero Data Retention orgs cannot use the Responses API's default
-        // server-side item store: step 2 fails with "Items are not persisted"
-        // when prior reasoning is referenced by id. `store: false` makes the
-        // provider request `reasoning.encrypted_content` and send the whole
-        // history back inline instead.
+        // server-side item store: a later step fails with "Items are not
+        // persisted" when prior reasoning is referenced by id. `store: false`
+        // makes the provider request `reasoning.encrypted_content` and send
+        // the whole history back inline instead.
         store: false,
       },
     },
     telemetry: {
-      // Content is recorded because the trajectory stream needs it. Keeping
-      // it out of the app stream is our job, not this flag's.
+      // Content is recorded because the trajectory stream needs it. Keeping it
+      // out of the application stream is not this flag's job — the flag is
+      // per call and every integration sees it. The two streams are separated
+      // by writing to two tracers. See QUESTIONS.md #2.
       recordInputs: true,
       recordOutputs: true,
       functionId: 'math-assistant',
-      integrations,
+      integrations: [
+        appTelemetry(options.conversationId, facets),
+        trajectory(options.env).integration(facets),
+      ],
     },
   })
 }

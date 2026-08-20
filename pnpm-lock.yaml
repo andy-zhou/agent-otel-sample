@@ -11,6 +11,9 @@ importers:
       '@ai-sdk/openai':
         specifier: 4.0.42
         version: 4.0.42(zod@4.4.3)
+      '@ai-sdk/otel':
+        specifier: 1.0.67
+        version: 1.0.67(zod@4.4.3)
       '@microlabs/otel-cf-workers':
         specifier: 1.0.0-rc.52
         version: 1.0.0-rc.52(@opentelemetry/api@1.9.1)
@@ -59,6 +62,10 @@ packages:
     engines: {node: '>=22'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/otel@1.0.67':
+    resolution: {integrity: sha512-QJxtF/wEguGcYTqgr1LL8lRC4AlsbkDM0J9PwgZcnM5944u8XH46WOg1GlJCGaChcARqDXujcImTMrLBVtHWaA==}
+    engines: {node: '>=22'}
 
   '@ai-sdk/provider-utils@5.0.27':
     resolution: {integrity: sha512-EzAn4pdgG5g0xXtH6lE2zyNmfjDQIDjATkfqzuidEI35g++hh4+07vnjzkT/RmGmIClPZiRj/Q2GMPV2V7mkHw==}
@@ -859,6 +866,14 @@ snapshots:
       '@ai-sdk/provider': 4.0.7
       '@ai-sdk/provider-utils': 5.0.27(zod@4.4.3)
       zod: 4.4.3
+
+  '@ai-sdk/otel@1.0.67(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.7
+      '@opentelemetry/api': 1.9.1
+      ai: 7.0.67(zod@4.4.3)
+    transitivePeerDependencies:
+      - zod
 
   '@ai-sdk/provider-utils@5.0.27(zod@4.4.3)':
     dependencies:

@@ -52,16 +52,22 @@ and each integration can read them off the event. But they are set per *call*,
 not per integration — the events carry messages and tool output regardless, and
 every registered integration sees them.
 
-So the PII boundary in this repo is enforced entirely by our own code: the
-`app` integration simply chooses not to read the content fields, and the
-exporter drops any content attribute that reached a span anyway. Two layers,
-both ours.
+So a flag cannot separate the streams. What separates them here is that the two
+integrations write to two different tracers, backed by two different providers:
+content-bearing spans are never *constructed* by the provider that feeds the
+operational backend. That is a structural guarantee rather than a filter we
+maintain, and it is the main thing we would like sanity-checked.
 
-Is there a platform-level control we should be using instead — something that
-prevents content from reaching a given exporter regardless of application code?
-This is the part of the design we are least comfortable defending to a
-reviewer, because "we promise not to read that field" is a code review away
-from being false.
+- On Workers specifically, is running two `TracerProvider`s in one isolate
+  sound? Two processors, two flush lifecycles, both draining under the same
+  `waitUntil` budget.
+- Is there any platform-level control that would make this unnecessary — a way
+  to guarantee an exporter can never receive a given class of attribute
+  regardless of application code?
+- Anything wrong with a span in one trace being created by a tracer from a
+  different provider than its parent? It works — both streams come out with the
+  same trace id — but we would rather hear that it is intended than that it
+  happens to work.
 
 ### 3. Trace context across a Durable Object boundary
 
@@ -105,11 +111,14 @@ for the whole trace, not per stream.
 
 ### 6. Proving the application stream is clean
 
-Right now the guarantee is an allowlist plus a code review. A verified run
-gives 0 content attributes on the application stream and 16 on the trajectory
-stream, which is the number we would assert in CI. Beyond that we want
-something enforced outside our code, so that a mistake in this repo cannot put
-customer content in an operational backend.
+The guarantee is now that one file never reads a content field, and that the
+provider feeding the operational backend never constructs a span that has one.
+A verified run gives 0 content attributes on the application stream and 19 on
+the trajectory stream — the number we would assert in CI.
+
+That is much better than a filter, but it is still our code. We want something
+enforced outside it, so that a mistake in this repo cannot put customer content
+in an operational backend.
 
 Is there a Workers-side enforcement point for that — an egress policy, a
 binding that can only reach one endpoint, anything that makes the boundary
@@ -160,28 +169,24 @@ attributes rather than events, which the current semconv also does.
 - Anything you would name differently for the agent-specific spans, where
   semconv is still thin?
 
-### 11. Two tracer providers, or one trace projected twice?
+### 11. Span volume, now that the agent is traced twice
 
-This sample keeps one trace and projects it at the exporter: every span is
-created by one tracer, tagged with an audience, and the exporter decides which
-attributes each backend sees.
+Two providers means the agent portion of the trace is emitted twice: a `chat`
+span on the operational stream and another on the trajectory stream, plus a
+`step` layer that only the trajectory stream carries. One request to this
+sample produces 10 spans on one stream and 9 on the other.
 
-The alternative is two `TracerProvider`s — give the AI SDK integration a
-tracer backed by a provider whose only processor ships to the evaluation
-backend, so content-bearing spans are *never constructed* by the provider that
-feeds the operational backend. `@ai-sdk/otel` supports exactly this via its
-`tracer` option, and it makes the boundary structural rather than a filter we
-maintain (which is question #2's whole worry).
+An earlier revision kept one span per operation and projected it at the
+exporter, which halved the volume but put the PII boundary in a filter (see
+#2). We took the duplication deliberately.
 
-The cost is that the two providers do not share a span processor, so
-cross-referencing depends on both backends surfacing the shared trace id, or on
-writing an explicit permalink attribute onto the operational span.
-
-- On Workers specifically, is running two `TracerProvider`s in one isolate
-  sound — two batch processors, two flush lifecycles, two `waitUntil` budgets?
-- Does context propagation behave if spans in one trace are created by two
-  different tracers from different providers?
-- Which would you instrument this way if it were your service?
+- At production volume, is doubling agent spans the sort of thing that bites on
+  Workers — CPU for serialisation, subrequest limits on export, cost?
+- Would you expect the two streams to be sampled independently, and if so, does
+  a head-sampling decision on the shared trace force the same answer on both?
+  (Related: #5.)
+- Is there a reason to prefer one provider with two exporters over two
+  providers, on the platform rather than in principle?
 
 ### 12. Non-semconv attributes and a naming collision
 

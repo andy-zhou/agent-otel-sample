@@ -2,7 +2,8 @@ import { instrument } from '@microlabs/otel-cf-workers'
 import { Hono } from 'hono'
 import type { ModelMessage } from 'ai'
 import { runAgent } from './agent'
-import { spanProcessor, traceConfig } from './telemetry/config'
+import { appProcessor, traceConfig } from './telemetry/config'
+import { trajectory } from './telemetry/trajectory'
 import type { Env } from './env'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -31,7 +32,7 @@ app.post('/chat', async (c) => {
   }
 
   const result = runAgent({
-    apiKey: c.env.OPENAI_API_KEY,
+    env: c.env,
     messages: body.messages,
     conversationId: body.conversationId,
     // Request-scoped dimensions to group both streams by — session, task type,
@@ -43,11 +44,12 @@ app.post('/chat', async (c) => {
   // and keeps opening and closing spans — after this Response is handed back,
   // so the flush has to wait for generation rather than for the handler.
   // `result.steps` settles when the last step is done.
-  // `result.steps` is a PromiseLike, so it is wrapped rather than chained.
+  // Both streams flush here, once generation is done. `result.steps` is a
+  // PromiseLike, so it is wrapped rather than chained.
   c.executionCtx.waitUntil(
     Promise.resolve(result.steps)
       .catch(() => undefined)
-      .then(() => spanProcessor(c.env).flush()),
+      .then(() => Promise.all([appProcessor(c.env).flush(), trajectory(c.env).flush()])),
   )
 
   return result.toTextStreamResponse()
