@@ -21,7 +21,11 @@ app.get('/', (c) =>
  * trace-propagation question this sample does not answer — see QUESTIONS.md #3.
  */
 app.post('/chat', async (c) => {
-  const body = await c.req.json<{ messages: ModelMessage[]; conversationId?: string }>()
+  const body = await c.req.json<{
+    messages: ModelMessage[]
+    conversationId?: string
+    facets?: Record<string, string | number | boolean>
+  }>()
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return c.json({ error: 'messages must be a non-empty array' }, 400)
   }
@@ -30,6 +34,9 @@ app.post('/chat', async (c) => {
     apiKey: c.env.OPENAI_API_KEY,
     messages: body.messages,
     conversationId: body.conversationId,
+    // Request-scoped dimensions to group both streams by — session, task type,
+    // tenant, whatever the caller slices on. Identifiers only, never free text.
+    facets: body.facets,
   })
 
   // Returns as soon as the first token is ready. The agent keeps running —

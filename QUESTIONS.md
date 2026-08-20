@@ -159,3 +159,57 @@ attributes rather than events, which the current semconv also does.
 - Is that what your tooling expects to render?
 - Anything you would name differently for the agent-specific spans, where
   semconv is still thin?
+
+### 11. Two tracer providers, or one trace projected twice?
+
+This sample keeps one trace and projects it at the exporter: every span is
+created by one tracer, tagged with an audience, and the exporter decides which
+attributes each backend sees.
+
+The alternative is two `TracerProvider`s — give the AI SDK integration a
+tracer backed by a provider whose only processor ships to the evaluation
+backend, so content-bearing spans are *never constructed* by the provider that
+feeds the operational backend. `@ai-sdk/otel` supports exactly this via its
+`tracer` option, and it makes the boundary structural rather than a filter we
+maintain (which is question #2's whole worry).
+
+The cost is that the two providers do not share a span processor, so
+cross-referencing depends on both backends surfacing the shared trace id, or on
+writing an explicit permalink attribute onto the operational span.
+
+- On Workers specifically, is running two `TracerProvider`s in one isolate
+  sound — two batch processors, two flush lifecycles, two `waitUntil` budgets?
+- Does context propagation behave if spans in one trace are created by two
+  different tracers from different providers?
+- Which would you instrument this way if it were your service?
+
+### 12. Non-semconv attributes and a naming collision
+
+We add `gen_ai.outcome`, `gen_ai.usage.total_tokens` and `error.*` because
+semconv 1.43 has no equivalent. Two questions:
+
+- Is squatting on the `gen_ai.*` namespace for attributes that are not in the
+  spec a bad idea? A future semconv release could define `gen_ai.outcome` with
+  different values than ours.
+- Reasoning tokens are `gen_ai.usage.reasoning.output_tokens` in semconv 1.43,
+  but at least one internal implementation writes
+  `gen_ai.usage.reasoning_tokens`. Whichever is right, disagreeing about it
+  silently splits a cost dashboard in half. Does your tooling key on the
+  semconv name?
+
+### 13. Provider rate-limit headers are not reachable from telemetry events
+
+The most useful capacity signal a provider gives us is its rate-limit response
+headers — `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-requests`,
+`retry-after` on a 429. Those are exactly what the application stream should
+carry, and they are per-model-call.
+
+The AI SDK's telemetry events do not expose response headers, so the only way
+to capture them is to wrap the model with `wrapLanguageModel` middleware and
+emit a span from there — a second, parallel instrumentation path alongside the
+telemetry integrations, for data that arrives on the same HTTP response.
+
+- Is there a Workers-side way to observe outbound response headers that we
+  should prefer over model middleware?
+- More generally: should provider throttling be a platform-level signal rather
+  than something every application re-derives from headers?

@@ -45,6 +45,7 @@ import {
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_TYPE,
+  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -53,9 +54,13 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL,
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from '@opentelemetry/semantic-conventions/incubating'
-import type { Telemetry } from 'ai'
+import { APICallError, type Telemetry } from 'ai'
 import {
   ATTR_AUDIENCE,
+  ATTR_ERROR_KIND,
+  ATTR_ERROR_MESSAGE,
+  ATTR_OUTCOME,
+  ATTR_USAGE_TOTAL_TOKENS,
   ATTR_LM_OUTPUT_TOKENS_PER_SECOND,
   ATTR_LM_RESPONSE_MS,
   ATTR_LM_TOTAL_TOKENS_PER_SECOND,
@@ -70,12 +75,48 @@ function json(value: unknown): string {
   return JSON.stringify(value ?? null)
 }
 
+/**
+ * Tool definitions are the same schemas on every model call of every request,
+ * and the full JSON Schema dwarfs the conversation. Names are enough to know
+ * what the model could choose from; the definitions themselves belong in the
+ * prompt registry, not in every span.
+ */
+function toolNames(tools: ReadonlyArray<Record<string, unknown>> | undefined): string {
+  if (!tools) return '[]'
+  return json(tools.map((tool) => (typeof tool.name === 'string' ? tool.name : tool)))
+}
+
+/**
+ * Classify a failure. A provider 429 is worth counting separately from a bug:
+ * one means buy more capacity, the other means fix something.
+ */
+function outcomeAttributes(error: unknown) {
+  const rateLimited = APICallError.isInstance(error) && error.statusCode === 429
+  const err = error instanceof Error ? error : undefined
+  return {
+    [ATTR_OUTCOME]: rateLimited ? 'rate_limited' : 'error',
+    [ATTR_ERROR_KIND]: err?.name ?? 'Error',
+    [ATTR_ERROR_MESSAGE]: err?.message ?? String(error),
+  }
+}
+
 export interface AgentTelemetry {
   /** Registration order is load-bearing: create, decorate, close. */
   integrations: [Telemetry, Telemetry, Telemetry]
 }
 
-export function createAgentTelemetry(conversationId: string | undefined): AgentTelemetry {
+/**
+ * Request-scoped dimensions written onto every span in both streams — the
+ * things you group by when asking "which sessions are slow" or "does this
+ * task type fail more". Identifiers only: a facet value must never be free
+ * text, or the application stream stops being content-free.
+ */
+export type Facets = Record<string, string | number | boolean>
+
+export function createAgentTelemetry(
+  conversationId: string | undefined,
+  facets: Facets = {},
+): AgentTelemetry {
   const tracer = trace.getTracer('agent-otel-sample')
 
   /**
@@ -89,6 +130,10 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
   const modelSpans = new Map<string, Span>()
   const toolSpans = new Map<string, Span>()
   const modelCallCounts = new Map<string, number>()
+
+  const facetAttributes = Object.fromEntries(
+    Object.entries(facets).map(([key, value]) => [`facet.${key}`, value]),
+  )
 
   const modelKey = (callId: string, ordinal: number) => `${callId}:${ordinal}`
   const currentModel = (callId: string) => modelSpans.get(modelKey(callId, modelCallCounts.get(callId) ?? 0))
@@ -111,6 +156,7 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
           [ATTR_GEN_AI_PROVIDER_NAME]: event.provider,
           [ATTR_GEN_AI_REQUEST_MODEL]: event.modelId,
           [ATTR_GEN_AI_REQUEST_STREAM]: event.operationId === 'ai.streamText',
+          ...facetAttributes,
           ...(conversationId ? { [ATTR_GEN_AI_CONVERSATION_ID]: conversationId } : {}),
         },
       })
@@ -133,6 +179,7 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
             [ATTR_GEN_AI_PROVIDER_NAME]: event.provider,
             [ATTR_GEN_AI_REQUEST_MODEL]: event.modelId,
             [ATTR_STEP_NUMBER]: ordinal,
+            ...facetAttributes,
           },
         },
         parent ? trace.setSpan(context.active(), parent) : context.active(),
@@ -151,6 +198,9 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
         [ATTR_GEN_AI_USAGE_OUTPUT_TOKENS]: event.usage.outputTokens ?? 0,
         [ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS]:
           event.usage.inputTokenDetails?.cacheReadTokens ?? 0,
+        [ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS]:
+          event.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
+        [ATTR_USAGE_TOTAL_TOKENS]: event.usage.totalTokens ?? 0,
         [ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS]:
           event.usage.outputTokenDetails?.reasoningTokens ?? 0,
         [ATTR_LM_RESPONSE_MS]: event.performance.responseTimeMs,
@@ -161,6 +211,7 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
         ...(event.performance.outputTokensPerSecond !== undefined
           ? { [ATTR_LM_OUTPUT_TOKENS_PER_SECOND]: event.performance.outputTokensPerSecond }
           : {}),
+        [ATTR_OUTCOME]: 'success',
       })
     },
 
@@ -179,6 +230,7 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
             [ATTR_GEN_AI_TOOL_NAME]: event.toolCall.toolName,
             [ATTR_GEN_AI_TOOL_CALL_ID]: event.toolCall.toolCallId,
             [ATTR_GEN_AI_TOOL_TYPE]: 'function',
+            ...facetAttributes,
           },
         },
         parent ? trace.setSpan(context.active(), parent) : context.active(),
@@ -191,9 +243,13 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
       if (!span) return
       span.setAttribute(ATTR_TOOL_EXECUTION_MS, event.toolExecutionMs)
       if (event.toolOutput.type === 'tool-error') {
-        // No message: it can quote the tool input. The app stream learns that
-        // the tool failed, the trajectory stream learns why.
+        // The error *message* can quote the tool input, so it stays on the
+        // trajectory stream. The app stream learns that the tool failed and
+        // what kind of failure it was, not what was in it.
+        span.setAttribute(ATTR_OUTCOME, 'error')
         span.setStatus({ code: SpanStatusCode.ERROR })
+      } else {
+        span.setAttribute(ATTR_OUTCOME, 'success')
       }
     },
 
@@ -204,8 +260,10 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
         span.setAttributes({
           [ATTR_GEN_AI_USAGE_INPUT_TOKENS]: event.totalUsage.inputTokens ?? 0,
           [ATTR_GEN_AI_USAGE_OUTPUT_TOKENS]: event.totalUsage.outputTokens ?? 0,
+          [ATTR_USAGE_TOTAL_TOKENS]: event.totalUsage.totalTokens ?? 0,
           [ATTR_STEP_COUNT]: event.steps.length,
           [ATTR_GEN_AI_RESPONSE_FINISH_REASONS]: [event.finishReason],
+          [ATTR_OUTCOME]: 'success',
         })
       }
     },
@@ -251,7 +309,7 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
     onLanguageModelCallStart(event) {
       currentModel(event.callId)?.setAttributes({
         [ATTR_GEN_AI_INPUT_MESSAGES]: json(event.messages),
-        ...(event.tools ? { [ATTR_GEN_AI_TOOL_DEFINITIONS]: json(event.tools) } : {}),
+        [ATTR_GEN_AI_TOOL_DEFINITIONS]: toolNames(event.tools),
       })
     },
 
@@ -309,9 +367,10 @@ export function createAgentTelemetry(conversationId: string | undefined): AgentT
     },
 
     onError(error) {
-      const message = error instanceof Error ? error.message : 'unknown error'
+      const attributes = outcomeAttributes(error)
       for (const span of [...toolSpans.values(), ...modelSpans.values(), ...runSpans.values()]) {
-        span.setStatus({ code: SpanStatusCode.ERROR, message })
+        span.setAttributes(attributes)
+        span.setStatus({ code: SpanStatusCode.ERROR, message: String(attributes[ATTR_ERROR_MESSAGE]) })
         span.end()
       }
       toolSpans.clear()

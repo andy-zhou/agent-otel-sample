@@ -1,6 +1,6 @@
 import { createOpenAI } from '@ai-sdk/openai'
 import { stepCountIs, streamText, type ModelMessage } from 'ai'
-import { createAgentTelemetry } from './telemetry/integrations'
+import { createAgentTelemetry, type Facets } from './telemetry/integrations'
 import { calculator } from './tools'
 
 const SYSTEM_PROMPT = [
@@ -14,9 +14,10 @@ export function runAgent(options: {
   apiKey: string
   messages: ModelMessage[]
   conversationId?: string
+  facets?: Facets
 }) {
   const openai = createOpenAI({ apiKey: options.apiKey })
-  const { integrations } = createAgentTelemetry(options.conversationId)
+  const { integrations } = createAgentTelemetry(options.conversationId, options.facets)
 
   return streamText({
     model: openai('gpt-5'),

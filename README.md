@@ -125,14 +125,57 @@ an allowlist and not a denylist so that a new content attribute added anywhere
 in this repo is dropped from the application stream by default, rather than
 leaked by default.
 
+Four attributes are ours rather than semconv's, because semconv has no
+equivalent and dashboards need them:
+
+- `gen_ai.outcome` — `success` | `error` | `rate_limited`. A provider 429 means
+  buy capacity; a 500 means fix something. A status code alone does not
+  separate them.
+- `gen_ai.usage.total_tokens` — saves every query summing two attributes.
+- `error.kind` / `error.message` — several APM backends read error information
+  from span attributes and ignore the OTel exception event, so a span that
+  looks error-free there is not evidence of an error-free request.
+
+### Facets: the dimensions you group by
+
+`POST /chat` accepts a `facets` object, written onto every span in both streams
+under a `facet.` prefix:
+
+```json
+{ "facets": { "session_id": "sess_42", "task_type": "arithmetic", "tenant": "acme" } }
+```
+
+That is what makes the application stream answerable — "which task types fail
+most", "is this tenant slower" — without any content. Facet values must be
+identifiers, never free text; a free-text facet would put content back into the
+stream that exists not to have any.
+
+### Payload size is a first-class concern
+
+`gen_ai.tool.definitions` is compacted to tool *names*. The full JSON Schema is
+identical on every model call of every request, and it dwarfs the conversation
+it is attached to — for this sample, a one-tool agent, the uncompacted schema
+was larger than the entire chat history, repeated three times per request.
+
 ### Three integrations write the spans
 
 AI SDK v7 replaced v5's `experimental_telemetry` + ambient OTel tracer with a
 pluggable integration interface: lifecycle hooks (`onStart`,
 `onLanguageModelCallStart/End`, `onToolExecutionStart/End`, `onEnd`, `onError`)
 plus wrapper hooks (`executeLanguageModelCall`, `executeTool`) that let an
-integration run the underlying operation inside its own span context. There is
-no official OTel bridge package, so `src/telemetry/integrations.ts` is one.
+integration run the underlying operation inside its own span context.
+
+There *is* an official bridge — `@ai-sdk/otel`, which exports an
+`OpenTelemetry` class implementing `Telemetry` and takes a `tracer`, an
+`enrichSpan` callback, and toggles for usage, provider metadata, headers, tool
+choice and schema. It also emits a `step` span between the operation and the
+model call, which this sample folds into an `agent.step.number` attribute
+instead.
+
+`src/telemetry/integrations.ts` is hand-written anyway, because the point of
+this repo is to make the routing seam visible: which attribute goes to which
+stream, and why. Whether a real deployment should hand-roll this or configure
+`@ai-sdk/otel` is QUESTIONS.md #11.
 
 The SDK fans every event out to each integration in registration order, and
 this sample uses three:

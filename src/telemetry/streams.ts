@@ -26,6 +26,7 @@ import {
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_TYPE,
+  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
@@ -42,6 +43,22 @@ export type Audience = 'app' | 'trajectory' | 'both'
  * Non-semconv attributes we add ourselves. Prefixed so a reviewer can tell
  * at a glance what is standard and what we invented.
  */
+/**
+ * Not in semconv 1.43, but wanted anyway.
+ *
+ * `gen_ai.outcome` makes throttling countable and distinct from generic
+ * failure, which a status code alone does not give you. `gen_ai.usage.
+ * total_tokens` saves every dashboard from summing two attributes.
+ *
+ * `error.kind` / `error.message` are span *attributes* because several APM
+ * backends read those and ignore the OTel exception event — so a span that
+ * looks error-free there is not evidence of an error-free request.
+ */
+export const ATTR_OUTCOME = 'gen_ai.outcome'
+export const ATTR_USAGE_TOTAL_TOKENS = 'gen_ai.usage.total_tokens'
+export const ATTR_ERROR_KIND = 'error.kind'
+export const ATTR_ERROR_MESSAGE = 'error.message'
+
 export const ATTR_STEP_COUNT = 'agent.step.count'
 export const ATTR_STEP_NUMBER = 'agent.step.number'
 export const ATTR_TOOL_EXECUTION_MS = 'agent.tool.execution_ms'
@@ -75,11 +92,16 @@ export const APP_ATTRIBUTE_ALLOWLIST: ReadonlySet<string> = new Set([
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_TYPE,
+  ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
   ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS,
   ATTR_GEN_AI_WORKFLOW_NAME,
+  ATTR_OUTCOME,
+  ATTR_USAGE_TOTAL_TOKENS,
+  ATTR_ERROR_KIND,
+  ATTR_ERROR_MESSAGE,
   ATTR_STEP_COUNT,
   ATTR_STEP_NUMBER,
   ATTR_TOOL_EXECUTION_MS,
@@ -96,7 +118,19 @@ export const APP_ATTRIBUTE_ALLOWLIST: ReadonlySet<string> = new Set([
  * NB: `url.*` can carry PII in query strings for other applications. It is
  * safe here because the only outbound call is to the provider API.
  */
-const APP_ALLOWED_PREFIXES = ['http.', 'url.', 'server.', 'network.', 'user_agent.', 'faas.', 'cloudflare.']
+const APP_ALLOWED_PREFIXES = [
+  'http.',
+  'url.',
+  'server.',
+  'network.',
+  'user_agent.',
+  'faas.',
+  'cloudflare.',
+  // Request-scoped dimensions the caller attaches to every span, so both
+  // streams can be sliced by session, task or agent loop. Identifiers only —
+  // never free text. See `facets` in integrations.ts.
+  'facet.',
+]
 
 export function isAppSafeAttribute(key: string): boolean {
   if (APP_ATTRIBUTE_ALLOWLIST.has(key)) return true
