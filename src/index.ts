@@ -1,25 +1,42 @@
 import { instrument } from '@microlabs/otel-cf-workers'
+import { context, propagation } from '@opentelemetry/api'
 import { Hono } from 'hono'
 import type { ModelMessage } from 'ai'
-import { runAgent } from './agent'
 import { appProcessor, traceConfig } from './telemetry/config'
-import { trajectory } from './telemetry/trajectory'
 import type { Env } from './env'
 
+export { SessionAgent } from './session-agent'
+
 const app = new Hono<{ Bindings: Env }>()
+
+/**
+ * The worker's own spans — request, Durable Object stub calls — are closed by
+ * the time a handler returns, so a flush here is not the dangling kind. The
+ * agent's spans are flushed inside the Durable Object, which is the whole
+ * point of it living there.
+ *
+ * NB: needed because worker and Durable Object are separate isolates in
+ * production, and so hold separate buffers. `wrangler dev` shares an isolate
+ * and hides the omission.
+ */
+app.use('*', async (c, next) => {
+  await next()
+  c.executionCtx.waitUntil(appProcessor(c.env).flush())
+})
 
 app.get('/', (c) =>
   c.json({
     service: 'agent-otel-sample',
-    endpoint: 'POST /chat',
+    endpoints: ['POST /chat', 'GET /chat/:conversationId'],
     streams: ['app', 'trajectory'],
   }),
 )
 
 /**
- * Stateless by design: the client posts the whole history each turn. Session
- * state would live in a Durable Object in a real deployment, which raises a
- * trace-propagation question this sample does not answer — see QUESTIONS.md #3.
+ * Starts a turn and returns. The agent runs in a Durable Object addressed by
+ * conversation id, so nothing here is holding it up — which is what lets the
+ * span flush be awaited rather than dangled off this request. See
+ * session-agent.ts.
  */
 app.post('/chat', async (c) => {
   const body = await c.req.json<{
@@ -31,28 +48,31 @@ app.post('/chat', async (c) => {
     return c.json({ error: 'messages must be a non-empty array' }, 400)
   }
 
-  const result = runAgent({
-    env: c.env,
+  const conversationId = body.conversationId ?? crypto.randomUUID()
+  const turnId = crypto.randomUUID()
+
+  // The DO gets trace context as data. Its spans then join this trace even
+  // though this request will be long gone by the time they close.
+  const traceCarrier: Record<string, string> = {}
+  propagation.inject(context.active(), traceCarrier)
+
+  const stub = c.env.SESSION_AGENT.get(c.env.SESSION_AGENT.idFromName(conversationId))
+  await stub.startTurn({
+    turnId,
     messages: body.messages,
-    conversationId: body.conversationId,
-    // Request-scoped dimensions to group both streams by — session, task type,
-    // tenant, whatever the caller slices on. Identifiers only, never free text.
+    conversationId,
     facets: body.facets,
+    traceCarrier,
   })
 
-  // Returns as soon as the first token is ready. The agent keeps running —
-  // and keeps opening and closing spans — after this Response is handed back,
-  // so the flush has to wait for generation rather than for the handler.
-  // `result.steps` settles when the last step is done.
-  // Both streams flush here, once generation is done. `result.steps` is a
-  // PromiseLike, so it is wrapped rather than chained.
-  c.executionCtx.waitUntil(
-    Promise.resolve(result.steps)
-      .catch(() => undefined)
-      .then(() => Promise.all([appProcessor(c.env).flush(), trajectory(c.env).flush()])),
-  )
+  return c.json({ conversationId, turnId, output: `/chat/${conversationId}` }, 202)
+})
 
-  return result.toTextStreamResponse()
+/** Reads the turn's output — replays what has landed, then follows it live. */
+app.get('/chat/:conversationId', async (c) => {
+  const conversationId = c.req.param('conversationId')
+  const stub = c.env.SESSION_AGENT.get(c.env.SESSION_AGENT.idFromName(conversationId))
+  return stub.fetch(new Request('https://session-agent/output'))
 })
 
 export default instrument(app satisfies ExportedHandler<Env>, traceConfig)

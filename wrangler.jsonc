@@ -7,6 +7,10 @@
   // AsyncLocalStorage to keep spans parented across await boundaries.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "SESSION_AGENT", "class_name": "SessionAgent" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SessionAgent"] }],
   "vars": {
     "APP_OTLP_ENDPOINT": "http://localhost:4318/app/v1/traces",
     "TRAJECTORY_OTLP_ENDPOINT": "http://localhost:4318/trajectory/v1/traces"

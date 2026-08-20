@@ -65,7 +65,24 @@ function truncate(text, max = 120) {
 const traces = new Map()
 
 function printTree(stream, incoming) {
-  const traceId = incoming[0]?.traceId ?? 'unknown'
+  // One batch can carry spans from more than one trace — a request that starts
+  // a turn and a later request that reads it are separate traces. Group by
+  // trace id, or the tree lies about who parents whom.
+  for (const [traceId, spans] of groupByTrace(incoming)) {
+    printTrace(stream, traceId, spans)
+  }
+}
+
+function groupByTrace(spans) {
+  const byTrace = new Map()
+  for (const span of spans) {
+    if (!byTrace.has(span.traceId)) byTrace.set(span.traceId, [])
+    byTrace.get(span.traceId).push(span)
+  }
+  return byTrace
+}
+
+function printTrace(stream, traceId, incoming) {
   const key = `${stream}:${traceId}`
   const spans = [...(traces.get(key) ?? []), ...incoming]
   traces.set(key, spans)

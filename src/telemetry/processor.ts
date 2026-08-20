@@ -1,18 +1,22 @@
 /**
- * A span processor that flushes when *we* say so.
+ * A span processor that buffers, and can be flushed on demand.
  *
- * `otel-cf-workers` flushes a trace when its root span ends. For a streamed
- * response the root span ends when the handler returns the `Response` — at the
- * first token — while the agent keeps running for seconds afterwards. Flushing
- * there exports spans that are still open, stamped with a forced end time and
- * missing every attribute written later, and the spans that finish after that
- * point are never exported at all.
+ * `otel-cf-workers` flushes a trace when its root span ends. That used to be
+ * actively wrong here: the agent ran in the worker behind a streamed response,
+ * so the root span ended at the first token while model and tool spans were
+ * still open. Measured at the time — step 1's model span exported with
+ * `end=+7ms` when it really ended at +3988ms, and the final step never arrived
+ * at all.
  *
- * Measured on this sample: step 1's model span exported with `end=+7ms` when
- * it actually ended at +3988ms, and the final step never arrived.
+ * Now the agent runs in a Durable Object, and the two callers want different
+ * things:
  *
- * So the flush that the library triggers is ignored, and the handler flushes
- * explicitly under `ctx.waitUntil` once generation has finished.
+ * - the **worker** has nothing long-running left. Its spans are closed by the
+ *   time the handler returns, so the library's flush-on-root-end is exactly
+ *   right and `forceFlush` honours it.
+ * - the **Durable Object** runs the turn as a task no request is waiting on,
+ *   and awaits `flush()` when the turn finishes. Anything the library flushes
+ *   earlier is simply a partial batch; the awaited flush catches the rest.
  */
 
 import type { Context } from '@opentelemetry/api'
@@ -30,13 +34,12 @@ export class DeferredSpanProcessor implements TraceFlushableSpanProcessor {
     this.buffered.push(span)
   }
 
-  /**
-   * What the library calls when the root span ends. Deliberately does nothing:
-   * at this point the agent is typically mid-flight.
-   */
-  async forceFlush(_traceId?: string): Promise<void> {}
+  /** What the library calls when a trace's root span ends. */
+  async forceFlush(_traceId?: string): Promise<void> {
+    await this.flush()
+  }
 
-  /** Export everything that has finished. Called by the request handler. */
+  /** Export everything that has finished. */
   async flush(): Promise<void> {
     const batch = this.buffered
     if (batch.length === 0) return

@@ -6,44 +6,37 @@ how much they would change the design.
 
 ---
 
-### 1. Span export when the response streams
+### 1. Durable Object lifetime for a task no request is waiting on
 
-We hit this for real, so this is less "how does it work" and more "is our
-workaround the one you would recommend".
+We think we have solved this one and would like to be told whether we have.
 
-`POST /chat` returns at the first token. `otel-cf-workers` flushes a trace when
-its root span ends — and the root span ends when the handler returns the
-`Response`, not when the body finishes streaming. With the library's own
-`BatchTraceSpanProcessor`, one request produced:
+Flushing on root-span end truncated traces badly when the agent ran in the
+worker behind a streamed response: spans still open were exported with a forced
+end time, and spans finishing after the last flush were dropped. Deferring the
+flush and dangling it off the returned request with `ctx.waitUntil` fixed the
+data but not the reasoning — we could not say how long the isolate would stay
+alive or what happened to buffered spans if the budget ran out.
 
-```
-batch 1 [app] fetchHandler POST      start=+0ms    end=+2ms
-batch 2 [app] invoke_agent           start=+2ms    end=+7ms     ← still running
-              chat gpt-5             start=+3ms    end=+7ms     ← really ended +3988ms
-...
-batch 8 [app] execute_tool calculator
-              (step 3's chat span and the final invoke_agent span never arrived)
-```
+The turn now runs in a Durable Object via `void this.runTurn(params)`, output is
+buffered and read back over a second request, and the flush is awaited at the
+end of the turn. Verified: one complete batch per stream, correct durations,
+nothing missing.
 
-Two failures. Spans still open at flush time were exported with a forced end
-time and without the attributes written later, and spans that finished after
-the last flush were dropped entirely. For an evaluation store a truncated
-trajectory is worse than no trajectory.
+What we cannot see from outside:
 
-Our fix is `src/telemetry/processor.ts`: ignore the library's flush, buffer
-ended spans, and flush explicitly from the handler under `ctx.waitUntil`, keyed
-on the promise that settles when the last step completes. That produces one
-correct batch per stream.
-
-- Is `waitUntil` the right primitive, or is there a hook for "the response body
-  has finished streaming" that we should be using instead?
-- How long will `waitUntil` really keep the isolate alive under load, and what
-  happens to buffered spans when that budget runs out — dropped silently, or is
-  there a signal we can catch and act on?
-- Does an aborted client connection cut the flush short? A user closing the tab
-  mid-answer is common, and we would still want the partial trajectory.
-- Is flush-on-root-span-end simply the wrong default for streaming responses on
-  Workers, and if so is that worth fixing upstream rather than in every app?
+- How long will a Durable Object keep running a promise that no request is
+  awaiting? `startTurn` returns immediately and the turn may run for tens of
+  seconds. Is fire-and-forget inside a DO a supported pattern, or are we
+  relying on something incidental?
+- What evicts it mid-turn, and is there a signal we can catch? Our span buffer
+  and the turn's output are both in memory, so an eviction loses telemetry for
+  the turn that most deserves it.
+- Should the buffer be in DO storage, and is an alarm-driven flush the pattern
+  you would reach for instead? The library already treats `do-alarm` as a
+  traced trigger, which suggests yes.
+- The worker and the DO are separate isolates and so hold separate span
+  buffers. `wrangler dev` shares an isolate and hid a missing flush from us
+  entirely. Is there a way to catch that class of mistake before production?
 
 ### 2. `recordInputs` / `recordOutputs` are not a per-integration filter
 
@@ -71,27 +64,43 @@ maintain, and it is the main thing we would like sanity-checked.
 
 ### 3. Trace context across a Durable Object boundary
 
-This sample is stateless to keep it small, but the real system puts session
-state in a Durable Object.
+We inject a W3C carrier into the RPC params in the worker and extract it in the
+object, rather than relying on ambient propagation:
 
-- Does trace context propagate into a DO stub call automatically, or must we
-  inject `traceparent` by hand?
-- Should the DO export spans itself (`instrumentDO`), or hand them back to the
-  calling Worker? Two isolates exporting into one trace raises clock-skew and
-  ordering questions we would rather not discover in production.
+```ts
+propagation.inject(context.active(), traceCarrier)                        // worker
+const parent = propagation.extract(context.active(), params.traceCarrier) // object
+```
+
+It works — both `invoke_agent` roots come back parented to the request span.
+But we chose it out of caution, not knowledge.
+
+- Does trace context propagate into a DO **stub RPC call** on its own, making
+  the carrier unnecessary?
+- Does `instrumentDO` wrap RPC methods, or only `fetch`, `alarm` and the
+  constructor? We see spans for the `fetch` read path but none for
+  `startTurn`, which is why the carrier is load-bearing for us.
 - Do DO alarms belong to the trace that scheduled them?
 
-### 4. Per-request vs. global integration registration
+### 4. Span-processor state and the isolate boundary
 
-The SDK offers `registerTelemetry(...integrations)` for global registration.
-We build integrations per request instead, because the open-span maps have to
-live somewhere and module scope is shared by every concurrent request in an
-isolate.
+The AI SDK offers `registerTelemetry(...integrations)` for global registration.
+We build integrations per turn instead, because the open-span maps have to live
+somewhere and module scope is shared by every concurrent request in an isolate.
+The span processors themselves *are* module-level singletons, one per isolate.
 
-Is per-request construction the right instinct on Workers, or does the isolate
-model make module-scope state safe here in a way it would not be in Node?
-Related: is `AsyncLocalStorage` under `nodejs_compat` the supported way to
-carry OTel context, and does it hold across `waitUntil`?
+Addressing the agent per conversation makes that mostly moot — a DO instance
+handles one turn at a time — but it raised a sharper question. Because the
+worker and the DO are separate isolates, they hold separate buffers, and we
+briefly shipped a version where the worker's spans were never flushed at all.
+It looked correct locally, because `wrangler dev` shares an isolate.
+
+- Is per-isolate processor state the right model on Workers, or does something
+  about the isolate lifecycle make it a trap?
+- Is the local/production isolate-boundary difference documented somewhere we
+  should have read? It is a silent, data-losing divergence.
+- Is `AsyncLocalStorage` under `nodejs_compat` the supported way to carry OTel
+  context, and does it hold across `waitUntil` and across a DO RPC boundary?
 
 ### 5. Sampling two streams at different rates
 

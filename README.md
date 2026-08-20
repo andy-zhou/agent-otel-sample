@@ -27,8 +27,18 @@ cp .dev.vars.example .dev.vars   # add your OPENAI_API_KEY
 
 pnpm sink                        # terminal 1 — local OTLP receiver on :4318
 pnpm dev                         # terminal 2 — wrangler dev on :8787
-pnpm demo                        # terminal 3 — one streamed request
+pnpm demo                        # terminal 3 — start a turn, then read it
 ```
+
+Two calls, because generating and responding are separated:
+
+```
+POST /chat                 → 202 { conversationId, turnId }   starts the turn
+GET  /chat/:conversationId → text stream                      reads its output
+```
+
+That shape is not incidental — it is what lets the span flush be awaited
+rather than dangled. See below.
 
 `pnpm sink` is a ~100-line Node server that accepts both streams on separate
 paths and prints each trace as a tree, marking content attributes with `◆`.
@@ -42,51 +52,53 @@ matching `*_OTLP_TOKEN`.
 
 ## What it emits
 
-One request produces one trace, and each stream gets its own tree within it.
+A turn produces one trace, with each stream getting its own tree inside it.
 Abridged, from an actual run of `pnpm demo` against `gpt-5`:
 
 ```
-── app stream          trace 93da21af…   10 spans, 0 content attributes
-  fetchHandler POST 20ms
-    invoke_agent math-assistant 7526ms
-      · gen_ai.usage.total_tokens = 1638
-      · agent.step.count = 3
-      · gen_ai.outcome = success
-      · facet.session_id = sess_42
-      chat gpt-5 4930ms
+── app stream          trace a6541b44…    1 span     ← worker flush, immediate
+  fetchHandler POST 41ms
+
+── app stream          trace a6541b44…   10 spans, 0 content attributes
+  fetchHandler POST 41ms                              ← same trace, later batch
+    invoke_agent math-assistant 7990ms                ← Durable Object flush
+      chat gpt-5 5704ms
         · gen_ai.usage.reasoning.output_tokens = 192
         · gen_ai.response.time_to_first_chunk = 4874
-        · gen_ai.outcome = success
         · gen_ai.openai.ratelimit.remaining_tokens = 39999384
-        · gen_ai.openai.ratelimit.reset_tokens = 0s
-        fetch POST api.openai.com 345ms
-      execute_tool calculator 1ms
-        · gen_ai.tool.name = calculator
-        · agent.tool.execution_ms = 0
-      chat gpt-5 1709ms
+        · gen_ai.outcome = success
+        fetch POST api.openai.com 462ms
       execute_tool calculator 0ms
-      chat gpt-5 878ms
+      chat gpt-5 1450ms
+      execute_tool calculator 0ms
+      chat gpt-5 827ms
 
-── trajectory stream   trace 93da21af…    9 spans, 19 content attributes
-  invoke_agent gpt-5 7527ms
+── trajectory stream   trace a6541b44…    9 spans, 19 content attributes
+  invoke_agent gpt-5 7990ms
     ◆ gen_ai.input.messages = [{"role":"user","content":"What is 17% of 4320…
-    ◆ gen_ai.system_instructions = "You are a careful arithmetic assistant…"
-    step 1 4932ms
-      chat gpt-5 4930ms
-        ◆ gen_ai.input.messages = […]
+    step 1 5706ms
+      chat gpt-5 5705ms
         ◆ gen_ai.output.messages = [{"type":"tool-call","toolName":"calculator"…
       execute_tool calculator 1ms
         ◆ gen_ai.tool.call.arguments = {"operation":"multiply","a":4320,"b":0.17}
         ◆ gen_ai.tool.call.result = {"result":734.4000000000001}
-    step 2 1710ms
-    step 3 879ms
+    step 2 1451ms
+    step 3 827ms
+
+── app stream          trace ff526098…    3 spans   ← the read request, its own trace
+  fetchHandler GET 2ms
+    Durable Object SESSION_AGENT 1ms
 ```
 
-Same trace id, two trees. The application stream has every token count, finish
-reason and timing and no message text at all. The trajectory stream has the
-conversation, plus a `step` layer the application stream does not bother with,
-and none of the transport spans — `fetchHandler` and the outbound `fetch` are
-not part of a trajectory.
+`invoke_agent` at 7990ms under a 41ms parent is not a bug — the POST returned
+in 41ms and the turn kept running. The two app-stream batches are the worker
+flushing its own span and the Durable Object flushing the agent's, and every
+batch holds only completed spans.
+
+Same trace id across both streams. The application stream has every token
+count, finish reason, timing and rate-limit number, and no message text at
+all. The trajectory stream has the conversation and a `step` layer, and none
+of the transport spans.
 
 ## How the split works
 
@@ -214,38 +226,71 @@ innermost. Both ours and `@ai-sdk/otel`'s implement it. It resolves in our
 favour, and it is verified rather than assumed — but it is not something we
 control, which is QUESTIONS.md #13.
 
-### We flush, not the library
+### Why the agent lives in a Durable Object
 
-`otel-cf-workers` flushes a trace when its root span ends. That is wrong for a
-streamed response, and measurably so — with the library's own processor, this
-sample produced:
+This is the second load-bearing decision, and it is about the flush.
 
-- step 1's model span exported with `end=+7ms` when it really ended at
-  `+3988ms`, carrying none of the usage attributes written afterwards, because
-  the flush fired when the handler returned the `Response` at the first token
-- the final step's span, and the correctly-ended `invoke_agent` span, never
-  exported at all
+`otel-cf-workers` flushes a trace when its root span ends. An earlier revision
+ran the agent in the worker behind a streamed response, which made that
+actively wrong: the root span ended at the first token while model and tool
+spans were still open. Measured at the time — step 1's model span exported
+with `end=+7ms` when it really ended at `+3988ms`, missing every attribute
+written afterwards, and the final step never arrived at all.
 
-`src/telemetry/processor.ts` therefore ignores the library's flush and buffers
-instead. The handler flushes explicitly under `ctx.waitUntil`, keyed on
-`result.steps`, which settles when the last step finishes:
+Deferring the flush and dangling it off the returned request with
+`ctx.waitUntil` fixed the data. It did not fix the reasoning: we could not say
+how long `waitUntil` would keep the isolate alive, or what happened to
+buffered spans if it ran out.
+
+So the turn moved into a Durable Object, and the important part is not the
+object — it is the decoupling:
 
 ```ts
-c.executionCtx.waitUntil(
-  Promise.resolve(result.steps)
-    .catch(() => undefined)
-    .then(() => spanProcessor(c.env).flush()),
-)
+startTurn(params: TurnParams): void {
+  // Not awaited: the caller's request must not be what keeps this alive.
+  void this.runTurn(params)
+}
 ```
 
-With that, one batch per stream leaves after generation completes and every
-span has a real duration. `fetchHandler` still reads 8ms — which is honest,
-the handler really did return that early.
+`startTurn` returns immediately. The turn runs as a task no request is waiting
+on, output is buffered and read back over a second call, and the flush is
+simply awaited at the end:
+
+```ts
+} finally {
+  await Promise.all([appProcessor(this.env).flush(), trajectory(this.env).flush()])
+}
+```
+
+Nothing is racing the isolate for it. Returning a stream from `startTurn`
+would have put the dangling flush right back, one layer down — which is why
+the read path is separate rather than a convenience.
+
+The worker still flushes its own spans under `waitUntil`, but that is no longer
+the load-bearing kind: its spans are all closed by the time a handler returns.
+
+**Trace context crosses into the object as data**, not ambiently:
+
+```ts
+const traceCarrier: Record<string, string> = {}
+propagation.inject(context.active(), traceCarrier)   // worker
+...
+const parent = propagation.extract(context.active(), params.traceCarrier)  // object
+```
+
+Verified: both `invoke_agent` roots — application and trajectory — come back
+parented to the POST request span, in its trace.
+
+NB: worker and Durable Object are **separate isolates in production**, so they
+hold separate span buffers and each must flush its own. `wrangler dev` shares
+an isolate, which hid that omission entirely until the raw OTLP was read — the
+worker's spans were going out in the object's batch.
 
 ## Layout
 
 ```
-src/index.ts                     Hono app, POST /chat, streams the response
+src/index.ts                     Hono app: start a turn, read a turn
+src/session-agent.ts             Durable Object: runs the turn, awaits the flush
 src/agent.ts                     streamText + calculator, stopWhen(6 steps)
 src/tools.ts                     the calculator
 src/telemetry/streams.ts         audiences and the app-stream allowlist
@@ -258,15 +303,16 @@ scripts/sink.mjs                 local OTLP receiver
 
 ## Deliberate omissions
 
-- **No Durable Object.** History is posted in the request body each turn. In a
-  real deployment session state would live in a DO, which raises a
-  propagation question this sample does not answer (QUESTIONS.md #3).
+- **The Durable Object stores nothing.** History is posted with each turn and
+  output is buffered in memory only, so an eviction mid-turn loses the output
+  and the buffered spans. Real session state is the obvious next step and is
+  deliberately absent here.
 - **No MCP.** The one tool is local and pure, so the only outbound HTTP is the
   provider call.
 - **No tests.** The content-attribute counts printed by `pnpm sink` are the
   check; asserting them in CI is the obvious next step (QUESTIONS.md #6).
-- **Streaming only.** `POST /chat` streams; there is no synchronous endpoint to
-  compare against, so the trickiest lifecycle is the only one exercised.
+- **One turn at a time.** A second `startTurn` while one is in flight logs and
+  overwrites rather than queueing.
 - **No sampling.** Everything is exported (QUESTIONS.md #5).
 - **The trajectory root has a dangling parent.** Its `invoke_agent` span is a
   child of the request span, which only exists in the application stream, so an

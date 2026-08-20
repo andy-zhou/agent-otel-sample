@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "sink": "node scripts/sink.mjs",
     "typecheck": "tsc --noEmit",
-    "demo": "curl -N -s -X POST http://localhost:8787/chat -H 'content-type: application/json' -d '{\"conversationId\":\"demo-1\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17% of 4320, then divide that by 3?\"}]}'"
+    "demo": "curl -s -X POST http://localhost:8787/chat -H 'content-type: application/json' -d '{\"conversationId\":\"demo-1\",\"facets\":{\"session_id\":\"sess_42\"},\"messages\":[{\"role\":\"user\",\"content\":\"What is 17% of 4320, then divide that by 3?\"}]}' && curl -N -s http://localhost:8787/chat/demo-1"
   },
   "dependencies": {
     "@ai-sdk/openai": "4.0.42",

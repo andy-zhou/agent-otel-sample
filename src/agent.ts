@@ -33,16 +33,9 @@ export function runAgent(options: {
     system: SYSTEM_PROMPT,
     messages: options.messages,
     tools: { calculator },
-    // Multi-step is the point: a single-step trace has no trajectory to
-    // evaluate. Each step is one model call plus any tool calls it triggers.
     stopWhen: stepCountIs(6),
     providerOptions: {
       openai: {
-        // Zero Data Retention orgs cannot use the Responses API's default
-        // server-side item store: a later step fails with "Items are not
-        // persisted" when prior reasoning is referenced by id. `store: false`
-        // makes the provider request `reasoning.encrypted_content` and send
-        // the whole history back inline instead.
         store: false,
       },
     },
